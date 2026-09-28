@@ -41,6 +41,14 @@ vi.mock('@core/features/conversations/node/controller', () => ({
     markConversationSeen: vi.fn(),
   }),
 }));
+const transcriptMocks = vi.hoisted(() => ({
+  saveTranscript: vi.fn(async () => {}),
+  loadTranscript: vi.fn(async () => null),
+}));
+vi.mock('./transcript-store', () => ({
+  saveTranscript: transcriptMocks.saveTranscript,
+  loadTranscript: transcriptMocks.loadTranscript,
+}));
 const target = {
   conversationId: 'conversation-1',
   projectId: 'project-1',
@@ -60,6 +68,130 @@ const target = {
 type TestRuntimeTarget = typeof target;
 
 describe('createConversationsWireController', () => {
+  it('captures ACP history after an attached session updates', async () => {
+    transcriptMocks.saveTranscript.mockClear();
+    let emitUpdate: (() => void) | undefined;
+    const exported = JSON.stringify({
+      committed: [
+        {
+          seq: 0,
+          initiator: 'user',
+          items: [{ kind: 'message', role: 'user', text: 'Keep this' }],
+        },
+      ],
+      active: null,
+    });
+    const controller = setupController({
+      client: {
+        acp: {
+          attach: vi.fn(async () => ok({ sessionId: null })),
+          exportAcpTranscript: vi.fn(async () => ok({ transcript: exported })),
+          session: {
+            state: () => ({
+              asLiveSource: () => ({
+                subscribe: (cb: () => void) => {
+                  emitUpdate = cb;
+                  return () => {};
+                },
+              }),
+            }),
+          },
+        },
+      },
+    });
+    await controller.call('acp.attach', { conversationId: target.conversationId });
+    await vi.waitFor(() => expect(emitUpdate).toBeDefined());
+    emitUpdate?.();
+    await vi.waitFor(() =>
+      expect(transcriptMocks.saveTranscript).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ conversationId: target.conversationId }),
+        expect.stringContaining('Keep this')
+      )
+    );
+  });
+
+  it('does not fail session attachment when transcript persistence fails', async () => {
+    transcriptMocks.saveTranscript.mockClear();
+    transcriptMocks.saveTranscript.mockRejectedValueOnce(new Error('disk unavailable'));
+    const attach = vi.fn(async () => ok({ sessionId: null }));
+    const controller = setupController({
+      client: {
+        acp: {
+          attach,
+          exportAcpTranscript: vi.fn(async () =>
+            ok({
+              transcript: JSON.stringify({
+                committed: [
+                  { seq: 0, initiator: 'user', items: [{ kind: 'message', text: 'hi' }] },
+                ],
+                active: null,
+              }),
+            })
+          ),
+          session: {
+            state: () => ({
+              asLiveSource: () => ({ subscribe: () => () => {} }),
+            }),
+          },
+        },
+      },
+    });
+    await expect(
+      controller.call('acp.attach', { conversationId: target.conversationId })
+    ).resolves.toMatchObject({ success: true });
+    expect(attach).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(transcriptMocks.saveTranscript).toHaveBeenCalled());
+  });
+
+  it('captures PTY output after a session starts', async () => {
+    transcriptMocks.saveTranscript.mockClear();
+    let emitUpdate: ((update: unknown) => void) | undefined;
+    const controller = setupController({
+      conversationType: 'pty',
+      client: {
+        tuiAgents: {
+          startSession: vi.fn(async () => ok({ outcome: 'started' as const })),
+          output: {
+            handle: () => ({
+              asLiveSource: () => ({
+                snapshot: () => ({
+                  generation: 1,
+                  sequence: 0,
+                  timestamp: Date.now(),
+                  data: { text: 'initial output\n', truncated: false, baseOffset: 0 },
+                }),
+                subscribe: (cb: (update: unknown) => void) => {
+                  emitUpdate = cb;
+                  return () => {};
+                },
+              }),
+            }),
+          },
+        },
+      },
+    });
+    await controller.call('tui.startSession', {
+      conversationId: target.conversationId,
+      providerId: 'claude',
+      cwd: '/repo',
+      sessionId: null,
+      model: null,
+      cols: 80,
+      rows: 24,
+    });
+    await vi.waitFor(() => expect(emitUpdate).toBeDefined());
+    emitUpdate?.({ generation: 1, sequence: 1, delta: { chunk: 'follow-up output' } });
+    await vi.waitFor(() =>
+      expect(transcriptMocks.saveTranscript).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ conversationId: target.conversationId }),
+        expect.stringContaining('follow-up output')
+      )
+    );
+  });
   it.each([false, true])(
     'shares native preferences only after provider acceptance (%s)',
     async (success) => {

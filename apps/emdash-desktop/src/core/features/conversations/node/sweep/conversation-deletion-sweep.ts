@@ -1,4 +1,5 @@
 import type { HostRef } from '@emdash/core/primitives/host/api';
+import { log } from '@emdash/shared/logger';
 import { and, isNotNull } from 'drizzle-orm';
 import {
   executeConversationRemoval,
@@ -17,6 +18,9 @@ import type {
   ReconcileSweepKind,
   ReconcileTombstone,
 } from '@core/services/reconcile-sweep/node/reconcile-sweep-service';
+import type { ConversationsRuntimeBroker } from '../../api/runtime-adapter';
+import { findConversationTranscriptMetadata } from '../transcript-repository';
+import { removeTranscript } from '../transcript-store';
 
 /**
  * The conversations registration for the entity-generic reconcile sweep (ADR 0006):
@@ -74,10 +78,29 @@ export function createConversationDeletionSweepKind(options: {
       return executeConversationRemoval(runtimes, host, tombstone.targetRecordId);
     },
 
-    async confirmGone(_host, id) {
+    async confirmGone(host, id) {
       // The sync snapshot application untracks tombstoned rows once a delivery
       // confirms the record absent — a row no longer live is a purged tombstone.
-      return createConversationRegistry(db).getLive(id) === undefined;
+      if (createConversationRegistry(db).getLive(id) !== undefined) return false;
+      const metadata = findConversationTranscriptMetadata(db, id);
+      if (metadata) {
+        try {
+          await removeTranscript(db, runtimes as ConversationsRuntimeBroker, {
+            conversationId: id,
+            projectId: metadata.projectId,
+            workspacePath: metadata.workspacePath,
+            title: metadata.title,
+            host,
+          });
+        } catch (error) {
+          log.warn('Could not remove transcript after conversation deletion', {
+            conversationId: id,
+            error,
+          });
+          return false;
+        }
+      }
+      return true;
     },
 
     async recordTerminalStop(_host, id, stop) {

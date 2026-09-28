@@ -19,6 +19,10 @@ import { linkConversationToTask } from './link-conversation-to-task';
 import { listHostConversations } from './list-host-conversations';
 import { markConversationSeen } from './markConversationSeen';
 import { renameConversation } from './renameConversation';
+import {
+  getConversationTranscriptMetadata,
+  listConversationTranscriptMetadata,
+} from './transcript-repository';
 
 export function createConversationOperations(dependencies: {
   db: AppDb;
@@ -74,6 +78,9 @@ export function createConversationOperations(dependencies: {
     getConversationsForTask: (projectId: string, taskId: string) =>
       getConversationsForTask(db, projectId, taskId),
     getConversationsForProject: (projectId: string) => getConversationsForProject(db, projectId),
+    listTranscripts: (projectId: string) => listConversationTranscriptMetadata(db, projectId),
+    getTranscript: (projectId: string, conversationId: string) =>
+      getConversationTranscriptMetadata(db, projectId, conversationId),
     markConversationSeen: (conversationId: string) => markConversationSeen(db, conversationId),
     listHostConversations: (scope: Parameters<typeof listHostConversations>[1]) =>
       listHostConversations(db, scope),

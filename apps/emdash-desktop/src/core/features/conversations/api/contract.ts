@@ -33,6 +33,7 @@ import {
 import type {
   Conversation,
   ConversationEvent,
+  ConversationTranscript,
   CreateConversationParams,
   HostConversationRow,
 } from '@core/primitives/conversations/api';
@@ -240,6 +241,14 @@ export const conversationsContract = defineContract({
   getConversationsForProject: procedure({
     input: z.object({ projectId: z.string() }),
     output: z.custom<Conversation[]>(),
+  }),
+  listTranscripts: procedure({
+    input: z.object({ projectId: z.string(), taskId: z.string() }),
+    output: z.custom<ConversationTranscript[]>(),
+  }),
+  getTranscript: procedure({
+    input: z.object({ projectId: z.string(), taskId: z.string(), conversationId: z.string() }),
+    output: z.custom<ConversationTranscript | null>(),
   }),
   markConversationSeen: procedure({
     input: z.object({ conversationId: z.string() }),

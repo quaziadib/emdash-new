@@ -4,14 +4,20 @@ import type { AppDb } from '@core/services/app-db/node/db';
 import { deleteHostConversation } from './delete-host-conversation';
 import { deleteConversation } from './deleteConversation';
 
-const { emit, remove, getLive } = vi.hoisted(() => ({
+const { emit, remove, getLive, getTranscriptMetadata, removeTranscript } = vi.hoisted(() => ({
   emit: vi.fn(),
   remove: vi.fn(),
   getLive: vi.fn(),
+  getTranscriptMetadata: vi.fn(),
+  removeTranscript: vi.fn(),
 }));
 
 vi.mock('./event-host', () => ({ conversationWireEvents: { emit } }));
 vi.mock('./remove-conversation', () => ({ removeConversationOrTombstone: remove }));
+vi.mock('./transcript-repository', () => ({
+  getConversationTranscriptMetadata: getTranscriptMetadata,
+}));
+vi.mock('./transcript-store', () => ({ removeTranscript }));
 vi.mock('@core/features/conversations/api/node/conversation-events', () => ({
   conversationEvents: { _emit: vi.fn() },
 }));
@@ -49,6 +55,8 @@ beforeEach(() => {
   vi.resetAllMocks();
   getLive.mockReturnValue(row);
   remove.mockResolvedValue('removed');
+  getTranscriptMetadata.mockReturnValue(null);
+  removeTranscript.mockResolvedValue(undefined);
 });
 
 describe.each(['task', 'machine'] as const)('%s conversation deletion events', (surface) => {
@@ -75,6 +83,25 @@ describe.each(['task', 'machine'] as const)('%s conversation deletion events', (
     remove.mockRejectedValue(new Error('Host rejected deletion'));
     await expect(deleteFromSurface()).rejects.toThrow('Host rejected deletion');
     expect(emit).not.toHaveBeenCalled();
+  });
+
+  it('removes the workspace transcript after immediate host removal', async () => {
+    getTranscriptMetadata.mockReturnValue({ workspacePath: '/workspace', title: 'Earlier tab' });
+    getLive.mockReturnValue({ ...row, workspacePath: '/workspace', title: 'Earlier tab' });
+    await deleteFromSurface();
+    expect(removeTranscript).toHaveBeenCalledOnce();
+    expect(removeTranscript.mock.calls[0]?.[2]).toMatchObject({
+      conversationId: row.id,
+      projectId: row.projectId,
+      workspacePath: '/workspace',
+    });
+  });
+
+  it('keeps the transcript until tombstone cleanup can reach the host', async () => {
+    getTranscriptMetadata.mockReturnValue({ workspacePath: '/workspace', title: 'Earlier tab' });
+    remove.mockResolvedValue('tombstoned');
+    await deleteFromSurface();
+    expect(removeTranscript).not.toHaveBeenCalled();
   });
 
   it('does not publish a second deletion for an absent record', async () => {

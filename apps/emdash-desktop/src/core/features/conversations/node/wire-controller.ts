@@ -41,6 +41,8 @@ import {
 } from '../api/runtime-adapter';
 import { conversationWireEvents } from './event-host';
 import { getProviderSettingsService } from './provider-settings-service';
+import { acpTranscriptMarkdown, ptyTranscriptMarkdown } from './transcript-markdown';
+import { loadTranscript, saveTranscript } from './transcript-store';
 
 type ConversationRuntimeTarget = Readonly<{
   conversationId: string;
@@ -50,6 +52,7 @@ type ConversationRuntimeTarget = Readonly<{
   providerId: string | null;
   sessionId: string | null;
   workspacePath?: string;
+  title?: string;
   host: HostRef;
   acpInput?: ConversationsAcpStartInput;
 }>;
@@ -104,6 +107,143 @@ export function createConversationsWireController(
     workspaceIdentity: options.workspaceIdentity,
   });
   const target = (conversationId: string) => resolveTarget(conversationId);
+  const pendingTranscriptWrites = new Map<string, Promise<void>>();
+  const persist = (runtimeTarget: ConversationRuntimeTarget, content: string): void => {
+    if (!runtimeTarget.workspacePath || !content.trim()) return;
+    const previous = pendingTranscriptWrites.get(runtimeTarget.conversationId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(() =>
+        saveTranscript(
+          options.db,
+          options.runtimes,
+          {
+            conversationId: runtimeTarget.conversationId,
+            projectId: runtimeTarget.projectId,
+            workspacePath: runtimeTarget.workspacePath!,
+            title: runtimeTarget.title ?? runtimeTarget.conversationId,
+            host: runtimeTarget.host,
+          },
+          content
+        )
+      )
+      .catch((error) => {
+        options.logger.warn('Could not save conversation transcript', { error });
+      });
+    pendingTranscriptWrites.set(runtimeTarget.conversationId, next);
+    void next.finally(() => {
+      if (pendingTranscriptWrites.get(runtimeTarget.conversationId) === next)
+        pendingTranscriptWrites.delete(runtimeTarget.conversationId);
+    });
+  };
+  const captureAcp = async (runtimeTarget: ConversationRuntimeTarget): Promise<void> => {
+    const resolved = await options.runtimes.client(runtimeTarget.host);
+    if (!resolved.success) return;
+    const exported = await resolved.data.acp.exportAcpTranscript({
+      conversationId: runtimeTarget.conversationId,
+    });
+    if (exported.success) persist(runtimeTarget, acpTranscriptMarkdown(exported.data.transcript));
+  };
+  const transcriptObservers = new Map<string, () => void>();
+  const observeAcp = async (
+    runtimeTarget: ConversationRuntimeTarget,
+    client: ConversationsHostRuntimesClient
+  ): Promise<void> => {
+    if (transcriptObservers.has(runtimeTarget.conversationId)) return;
+    const source = client.acp.session
+      .state({ conversationId: runtimeTarget.conversationId }, 'state')
+      .asLiveSource();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = undefined;
+        void captureAcp(runtimeTarget).catch((error) =>
+          options.logger.warn('Could not capture ACP transcript', { error })
+        );
+      }, 400);
+    };
+    const unsubscribe = await source.subscribe(schedule);
+    const stop = () => {
+      if (timer) clearTimeout(timer);
+      unsubscribe();
+      transcriptObservers.delete(runtimeTarget.conversationId);
+    };
+    transcriptObservers.set(runtimeTarget.conversationId, stop);
+    schedule();
+  };
+  const observePty = async (
+    runtimeTarget: ConversationRuntimeTarget,
+    client: ConversationsHostRuntimesClient
+  ): Promise<void> => {
+    if (transcriptObservers.has(runtimeTarget.conversationId)) return;
+    const source = client.tuiAgents.output
+      .handle({ conversationId: runtimeTarget.conversationId })
+      .asLiveSource();
+    let generation = -1;
+    let sequence = -1;
+    let output = '';
+    let previousContent = '';
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = undefined;
+        persist(runtimeTarget, previousContent + ptyTranscriptMarkdown(output));
+      }, 400);
+    };
+    if (runtimeTarget.workspacePath) {
+      try {
+        const existing = await loadTranscript(options.db, options.runtimes, {
+          conversationId: runtimeTarget.conversationId,
+          projectId: runtimeTarget.projectId,
+          workspacePath: runtimeTarget.workspacePath,
+          title: runtimeTarget.title ?? runtimeTarget.conversationId,
+          host: runtimeTarget.host,
+        });
+        previousContent = existing ? `${existing.trimEnd()}\n\n` : '';
+      } catch (error) {
+        options.logger.warn('Could not read previous terminal transcript', { error });
+      }
+    }
+    const unsubscribe = await source.subscribe((update) => {
+      const delta = update.delta as { chunk?: unknown };
+      if (
+        update.generation === generation &&
+        update.sequence > sequence &&
+        typeof delta.chunk === 'string'
+      ) {
+        output += delta.chunk;
+        sequence = update.sequence;
+        schedule();
+      } else if (update.generation !== generation) {
+        void Promise.resolve(source.snapshot()).then((snapshot) => {
+          const data = snapshot.data as { text: string; truncated: boolean };
+          generation = snapshot.generation;
+          sequence = snapshot.sequence;
+          output += `${output ? '\n\n' : ''}${data.truncated ? '[Earlier output unavailable]\n' : ''}${data.text}`;
+          schedule();
+        });
+      }
+    });
+    const snapshot = await source.snapshot();
+    const data = snapshot.data as { text: string; truncated: boolean };
+    generation = snapshot.generation;
+    sequence = snapshot.sequence;
+    output += `${data.truncated ? '[Earlier output unavailable]\n' : ''}${data.text}`;
+    if (output) schedule();
+    const stop = () => {
+      if (timer) {
+        clearTimeout(timer);
+        persist(runtimeTarget, previousContent + ptyTranscriptMarkdown(output));
+      }
+      unsubscribe();
+      transcriptObservers.delete(runtimeTarget.conversationId);
+    };
+    transcriptObservers.set(runtimeTarget.conversationId, stop);
+  };
+  const logCaptureError = (error: unknown) =>
+    options.logger.warn('Could not observe conversation transcript', { error });
   const run = <T, E>(
     conversationId: string,
     work: (
@@ -174,8 +314,11 @@ export function createConversationsWireController(
       withAttachedProject(options.projects, input.projectId, async () =>
         ok(await conversationOperations.createConversation(input))
       ),
-    deleteConversation: ({ projectId, taskId, conversationId }) =>
-      conversationOperations.deleteConversation(projectId, taskId, conversationId),
+    deleteConversation: async ({ projectId, taskId, conversationId }) => {
+      transcriptObservers.get(conversationId)?.();
+      await pendingTranscriptWrites.get(conversationId);
+      return conversationOperations.deleteConversation(projectId, taskId, conversationId);
+    },
     hydrateConversation: ({ projectId, taskId, conversationId, initialSize }) =>
       withAttachedProject(options.projects, projectId, async () => {
         await conversationOperations.hydrateConversation(
@@ -197,12 +340,52 @@ export function createConversationsWireController(
       conversationOperations.getConversationsForTask(projectId, taskId),
     getConversationsForProject: ({ projectId }) =>
       conversationOperations.getConversationsForProject(projectId),
+    listTranscripts: async ({ projectId, taskId }) => {
+      const [task] = await options.db
+        .select({ workspaceId: tasks.workspaceId })
+        .from(tasks)
+        .where(and(eq(tasks.id, taskId), eq(tasks.projectId, projectId)))
+        .limit(1);
+      const identity = task?.workspaceId
+        ? await options.workspaceIdentity.resolve(task.workspaceId)
+        : null;
+      if (!identity) return [];
+      return conversationOperations
+        .listTranscripts(projectId)
+        .filter((item) => item.workspacePath === identity.path);
+    },
+    getTranscript: async ({ projectId, taskId, conversationId }) => {
+      const metadata = conversationOperations.getTranscript(projectId, conversationId);
+      if (!metadata) return null;
+      const [task] = await options.db
+        .select({ workspaceId: tasks.workspaceId })
+        .from(tasks)
+        .where(and(eq(tasks.id, taskId), eq(tasks.projectId, projectId)))
+        .limit(1);
+      const identity = task?.workspaceId
+        ? await options.workspaceIdentity.resolve(task.workspaceId)
+        : null;
+      if (!identity || metadata.workspacePath !== identity.path) return null;
+      const runtimeTarget = await target(conversationId);
+      if (runtimeTarget.projectId !== projectId || !runtimeTarget.workspacePath) return null;
+      const content = await loadTranscript(options.db, options.runtimes, {
+        conversationId,
+        projectId,
+        workspacePath: runtimeTarget.workspacePath,
+        title: metadata.title,
+        host: runtimeTarget.host,
+      });
+      return content === null ? metadata : { ...metadata, content };
+    },
     markConversationSeen: ({ conversationId }) =>
       conversationOperations.markConversationSeen(conversationId),
     listHostConversations: (scope) => conversationOperations.listHostConversations(scope),
     linkConversationToTask: (input) => conversationOperations.linkConversationToTask(input),
-    deleteHostConversation: ({ conversationId }) =>
-      conversationOperations.deleteHostConversation(conversationId),
+    deleteHostConversation: async ({ conversationId }) => {
+      transcriptObservers.get(conversationId)?.();
+      await pendingTranscriptWrites.get(conversationId);
+      return conversationOperations.deleteHostConversation(conversationId);
+    },
     events: conversationWireEvents,
     acp: {
       setOption: (input, meta) =>
@@ -294,9 +477,11 @@ export function createConversationsWireController(
         const runtimeTarget = await target(conversationId);
         const input = runtimeTarget.acpInput;
         if (!input) throw missingAcpInputError(runtimeTarget);
-        return withConversationRuntime(options, Promise.resolve(runtimeTarget), (client) =>
-          client.acp.attach(input, callOptions(meta))
-        );
+        return withConversationRuntime(options, Promise.resolve(runtimeTarget), async (client) => {
+          const result = await client.acp.attach(input, callOptions(meta));
+          if (result.success) void observeAcp(runtimeTarget, client).catch(logCaptureError);
+          return result;
+        });
       },
       startSession: async ({ conversationId, mode }, meta) => {
         const runtimeTarget = await target(conversationId);
@@ -307,13 +492,26 @@ export function createConversationsWireController(
             { ...input, mode },
             { ...callOptions(meta), timeoutMs: 0 }
           );
+          if (result.success) void observeAcp(runtimeTarget, client).catch(logCaptureError);
           return result;
         });
       },
       loadHistory: (input, meta) =>
-        run(input.conversationId, (client) => client.acp.loadHistory(input, callOptions(meta))),
+        run(input.conversationId, async (client, runtimeTarget) => {
+          const result = await client.acp.loadHistory(input, callOptions(meta));
+          if (result.success && result.data.kind === 'available') {
+            void captureAcp(runtimeTarget).catch((error) =>
+              options.logger.warn('Could not capture ACP transcript', { error })
+            );
+          }
+          return result;
+        }),
       terminate: (input, meta) =>
-        run(input.conversationId, (client) => client.acp.terminate(input, callOptions(meta))),
+        run(input.conversationId, async (client) => {
+          const result = await client.acp.terminate(input, callOptions(meta));
+          if (result.success) transcriptObservers.get(input.conversationId)?.();
+          return result;
+        }),
       sendPrompt: (input, meta) =>
         run(input.conversationId, (client) =>
           client.acp.sendPrompt(input, { ...callOptions(meta), timeoutMs: 0 })
@@ -351,15 +549,25 @@ export function createConversationsWireController(
     },
     tui: {
       startSession: (input, meta) =>
-        run(input.conversationId, (client) =>
-          client.tuiAgents.startSession(input, callOptions(meta))
-        ),
+        run(input.conversationId, async (client, runtimeTarget) => {
+          const result = await client.tuiAgents.startSession(input, callOptions(meta));
+          if (result.success) void observePty(runtimeTarget, client).catch(logCaptureError);
+          return result;
+        }),
       resume: (input, meta) =>
-        run(input.conversationId, (client) => client.tuiAgents.resume(input, callOptions(meta))),
+        run(input.conversationId, async (client, runtimeTarget) => {
+          const result = await client.tuiAgents.resume(input, callOptions(meta));
+          if (result.success) void observePty(runtimeTarget, client).catch(logCaptureError);
+          return result;
+        }),
       stop: (input, meta) =>
         run(input.conversationId, (client) => client.tuiAgents.stop(input, callOptions(meta))),
       delete: (input, meta) =>
-        run(input.conversationId, (client) => client.tuiAgents.delete(input, callOptions(meta))),
+        run(input.conversationId, async (client) => {
+          const result = await client.tuiAgents.delete(input, callOptions(meta));
+          if (result.success) transcriptObservers.get(input.conversationId)?.();
+          return result;
+        }),
       kill: (input, meta) =>
         run(input.conversationId, (client) => client.tuiAgents.kill(input, callOptions(meta))),
       sendInput: async (input, meta) => {
@@ -374,10 +582,17 @@ export function createConversationsWireController(
       },
       resize: (input, meta) =>
         run(input.conversationId, (client) => client.tuiAgents.resize(input, callOptions(meta))),
-      output: async ({ conversationId }) =>
-        resolveConversationRuntimeSource(options, target(conversationId), (client) =>
-          client.tuiAgents.output.handle({ conversationId }).asLiveSource()
-        ),
+      output: async ({ conversationId }) => {
+        const runtimeTarget = await target(conversationId);
+        return resolveConversationRuntimeSource(
+          options,
+          Promise.resolve(runtimeTarget),
+          (client) => {
+            void observePty(runtimeTarget, client).catch(logCaptureError);
+            return client.tuiAgents.output.handle({ conversationId }).asLiveSource();
+          }
+        );
+      },
       sessions: tuiSessions,
     },
   });
@@ -426,6 +641,7 @@ async function resolveConversationRuntimeTarget(
       providerId: conversations.provider,
       sessionId: conversations.providerSessionId,
       config: conversations.config,
+      title: conversations.title,
       type: conversations.type,
       workspaceId: tasks.workspaceId,
     })
@@ -484,6 +700,7 @@ async function resolveConversationRuntimeTarget(
     projectId: row.projectId,
     taskId: row.taskId,
     conversationType: row.type === 'acp' ? 'acp' : 'pty',
+    title: row.title,
     providerId: row.providerId,
     sessionId: row.sessionId,
     workspacePath,

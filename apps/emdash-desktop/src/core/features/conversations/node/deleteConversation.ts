@@ -1,3 +1,5 @@
+import { hostRefFromParts } from '@emdash/core/primitives/host/api';
+import { log } from '@emdash/shared/logger';
 import { and, eq } from 'drizzle-orm';
 import { conversationEvents } from '@core/features/conversations/api/node/conversation-events';
 import type { ConversationRemovalBroker } from '@core/features/conversations/api/node/operations/conversation-removal';
@@ -8,8 +10,11 @@ import {
 import type { TelemetryService } from '@core/primitives/telemetry/api/telemetry';
 import type { AppDb } from '@core/services/app-db/node/db';
 import { appDbPokes } from '@core/services/app-db/node/pokes';
+import type { ConversationsRuntimeBroker } from '../api/runtime-adapter';
 import { conversationWireEvents } from './event-host';
 import { removeConversationOrTombstone } from './remove-conversation';
+import { getConversationTranscriptMetadata } from './transcript-repository';
+import { removeTranscript } from './transcript-store';
 
 /**
  * User-initiated conversation deletion, task-scoped (conversation spec §4.3 as amended
@@ -30,6 +35,8 @@ export async function deleteConversation(
       id: conversations.id,
       location: conversations.location,
       sshConnectionId: conversations.sshConnectionId,
+      title: conversations.title,
+      workspacePath: conversations.workspacePath,
     })
     .from(conversations)
     .where(
@@ -44,7 +51,21 @@ export async function deleteConversation(
   // Idempotent toward the caller: an already-deleted row is a no-op.
   if (!convRow) return;
 
-  await removeConversationOrTombstone(db, runtimes, convRow);
+  const outcome = await removeConversationOrTombstone(db, runtimes, convRow);
+  const metadata = getConversationTranscriptMetadata(db, projectId, conversationId);
+  if (outcome === 'removed' && metadata && convRow.workspacePath) {
+    try {
+      await removeTranscript(db, runtimes as ConversationsRuntimeBroker, {
+        conversationId,
+        projectId,
+        workspacePath: convRow.workspacePath,
+        title: convRow.title,
+        host: hostRefFromParts(convRow.location, convRow.sshConnectionId),
+      });
+    } catch (error) {
+      log.warn('Could not remove conversation transcript', { conversationId, error });
+    }
+  }
 
   conversationEvents._emit('conversation:deleted', conversationId);
   conversationWireEvents.emit(undefined, { type: 'deleted', conversationId, projectId, taskId });

@@ -1,11 +1,16 @@
+import { hostRefFromParts } from '@emdash/core/primitives/host/api';
+import { log } from '@emdash/shared/logger';
 import { conversationEvents } from '@core/features/conversations/api/node/conversation-events';
 import type { ConversationRemovalBroker } from '@core/features/conversations/api/node/operations/conversation-removal';
 import { createConversationRegistry } from '@core/features/conversations/api/node/registry';
 import type { TelemetryService } from '@core/primitives/telemetry/api/telemetry';
 import type { AppDb } from '@core/services/app-db/node/db';
 import { appDbPokes } from '@core/services/app-db/node/pokes';
+import type { ConversationsRuntimeBroker } from '../api/runtime-adapter';
 import { conversationWireEvents } from './event-host';
 import { removeConversationOrTombstone } from './remove-conversation';
+import { getConversationTranscriptMetadata } from './transcript-repository';
+import { removeTranscript } from './transcript-store';
 
 /**
  * The machine page's per-record delete (spec §8): the same removal verb as task-scoped
@@ -23,7 +28,23 @@ export async function deleteHostConversation(
   // Idempotent toward the caller: an absent row is a no-op.
   if (!row) return;
 
-  await removeConversationOrTombstone(db, runtimes, row);
+  const outcome = await removeConversationOrTombstone(db, runtimes, row);
+  if (outcome === 'removed' && row.projectId) {
+    const metadata = getConversationTranscriptMetadata(db, row.projectId, conversationId);
+    if (metadata) {
+      try {
+        await removeTranscript(db, runtimes as ConversationsRuntimeBroker, {
+          conversationId,
+          projectId: row.projectId,
+          workspacePath: metadata.workspacePath,
+          title: metadata.title,
+          host: hostRefFromParts(row.location, row.sshConnectionId),
+        });
+      } catch (error) {
+        log.warn('Could not remove conversation transcript', { conversationId, error });
+      }
+    }
+  }
 
   conversationEvents._emit('conversation:deleted', conversationId);
   if (row.projectId !== null && row.taskId !== null) {
