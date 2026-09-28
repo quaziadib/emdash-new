@@ -76,8 +76,9 @@ vi.mock('@core/primitives/keybindings/browser/confirm-button', () => ({
 vi.mock('@emdash/ui/react/primitives', () => {
   const container = ({ children }: { children?: ReactNode }) => children;
   return {
+    Button: container,
     Dialog: { Header: container, Title: container, Body: container, Footer: container },
-    Field: { Root: container, Label: container, Group: container },
+    Field: { Root: container, Label: container, Description: container, Group: container },
     Select: {
       Root: mocks.select,
       Trigger: container,
@@ -116,6 +117,7 @@ describe('conversation creation settings', () => {
     expect(mocks.createConversation).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'acp', options })
     );
+    expect(mocks.createConversation.mock.calls[0]?.[0]).not.toHaveProperty('initialQueue');
   });
   it('starts without provider overrides when nothing was selected', async () => {
     await createConversation();
@@ -131,6 +133,7 @@ describe('conversation creation settings', () => {
     const input = mocks.createConversation.mock.calls[0]?.[0] as { options?: unknown };
     expect(input).toMatchObject({ type: 'pty' });
     expect(input).not.toHaveProperty('model');
+    expect(input).not.toHaveProperty('initialPrompt');
     expect(input.options).toBeUndefined();
   });
 });

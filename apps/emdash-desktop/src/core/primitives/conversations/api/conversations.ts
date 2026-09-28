@@ -5,6 +5,16 @@ export const MAX_CONVERSATION_TITLE_LENGTH = 100;
 
 export type ConversationType = 'pty' | 'acp';
 
+export type ConversationTranscript = {
+  conversationId: string;
+  projectId: string;
+  workspacePath: string;
+  title: string;
+  relativePath: string;
+  updatedAt: string;
+  content?: string;
+};
+
 export type InitialQueuePrompt = {
   text: string;
   hiddenContext?: string;

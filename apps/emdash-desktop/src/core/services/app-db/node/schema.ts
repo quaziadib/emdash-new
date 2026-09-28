@@ -468,6 +468,24 @@ export const conversations = sqliteTable(
   })
 );
 
+export const conversationTranscripts = sqliteTable(
+  'conversation_transcripts',
+  {
+    conversationId: text('conversation_id').primaryKey(),
+    projectId: text('project_id').notNull(),
+    workspacePath: text('workspace_path').notNull(),
+    title: text('title').notNull(),
+    relativePath: text('relative_path').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (table) => ({
+    projectUpdatedAtIdx: index('idx_conversation_transcripts_project_updated_at').on(
+      table.projectId,
+      table.updatedAt
+    ),
+  })
+);
+
 export const terminals = sqliteTable(
   'terminals',
   {
